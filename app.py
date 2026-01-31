@@ -102,7 +102,62 @@ def extract_artist_from_event(event):
     return name.strip()
 
 
-def search_ticketmaster_events(artists, genres, latlong, radius, start_date, end_date, exclude_large_venues):
+@st.cache_data(ttl=86400)
+def get_artist_genres(artist_name, api_key):
+    """Look up an artist on Ticketmaster and extract their genre IDs."""
+    try:
+        response = requests.get(
+            "https://app.ticketmaster.com/discovery/v2/attractions.json",
+            params={
+                "apikey": api_key,
+                "keyword": artist_name,
+                "size": 5  # Get more results to find a better match
+            }
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            attractions = data.get("_embedded", {}).get("attractions", [])
+
+            # Find the best matching artist
+            search_lower = artist_name.lower().strip()
+            best_match = None
+
+            for attraction in attractions:
+                name = attraction.get("name", "").lower().strip()
+                # Exact match
+                if name == search_lower:
+                    best_match = attraction
+                    break
+                # Close match (search term is the full name or vice versa)
+                if best_match is None and (name.startswith(search_lower) or search_lower.startswith(name)):
+                    best_match = attraction
+
+            # Only use exact or close matches
+            if best_match:
+                classifications = best_match.get("classifications", [])
+                genre_ids = set()
+                genre_names = set()
+                for c in classifications:
+                    # Get genre
+                    genre = c.get("genre", {})
+                    if genre.get("id") and genre.get("id") != "KnvZfZ7vAvE":  # Exclude "Other"
+                        genre_ids.add(genre.get("id"))
+                        if genre.get("name"):
+                            genre_names.add(genre.get("name"))
+                    # Get subgenre
+                    subgenre = c.get("subGenre", {})
+                    if subgenre.get("id"):
+                        genre_ids.add(subgenre.get("id"))
+                        if subgenre.get("name"):
+                            genre_names.add(subgenre.get("name"))
+                return list(genre_ids), list(genre_names)
+    except requests.RequestException:
+        pass
+    return [], []
+
+
+def search_ticketmaster_events(artists, genre_ids, latlong, radius, start_date, end_date, exclude_large_venues):
     """Search Ticketmaster for events matching criteria."""
     api_key = st.secrets.get("TICKETMASTER_API_KEY", "")
     if not api_key:
@@ -117,15 +172,13 @@ def search_ticketmaster_events(artists, genres, latlong, radius, start_date, end
     seen_event_ids = set()
 
     # Search by artist keywords
-    search_terms = artists + genres
-
-    for term in search_terms:
-        if not term.strip():
+    for artist in artists:
+        if not artist.strip():
             continue
 
         params = {
             "apikey": api_key,
-            "keyword": term,
+            "keyword": artist,
             "latlong": latlong,
             "radius": radius,
             "unit": "miles",
@@ -156,14 +209,9 @@ def search_ticketmaster_events(artists, genres, latlong, radius, start_date, end
                         venues = event.get("_embedded", {}).get("venues", [])
                         if venues:
                             venue = venues[0]
-                            # Check multiple places where capacity might be stored
                             capacity = None
                             if venue.get("generalInfo", {}).get("capacity"):
                                 capacity = venue.get("generalInfo", {}).get("capacity")
-                            elif venue.get("upcomingEvents", {}).get("_total"):
-                                # Some venues store capacity differently
-                                pass
-                            # Also check boxOfficeInfo
                             if not capacity and venue.get("boxOfficeInfo", {}).get("capacity"):
                                 capacity = venue.get("boxOfficeInfo", {}).get("capacity")
 
@@ -178,7 +226,61 @@ def search_ticketmaster_events(artists, genres, latlong, radius, start_date, end
                     all_events.append(event)
 
         except requests.RequestException as e:
-            st.warning(f"Error searching for '{term}': {e}")
+            st.warning(f"Error searching for '{artist}': {e}")
+
+    # Search by genre IDs
+    for genre_id in genre_ids:
+        params = {
+            "apikey": api_key,
+            "genreId": genre_id,
+            "latlong": latlong,
+            "radius": radius,
+            "unit": "miles",
+            "classificationName": "Music",
+            "startDateTime": start_date.strftime("%Y-%m-%dT00:00:00Z"),
+            "endDateTime": end_date.strftime("%Y-%m-%dT23:59:59Z"),
+            "size": 50,
+            "sort": "date,asc"
+        }
+
+        try:
+            response = requests.get(
+                "https://app.ticketmaster.com/discovery/v2/events.json",
+                params=params
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                events = data.get("_embedded", {}).get("events", [])
+
+                for event in events:
+                    event_id = event.get("id")
+                    if event_id in seen_event_ids:
+                        continue
+
+                    # Check venue size if excluding large venues
+                    if exclude_large_venues:
+                        venues = event.get("_embedded", {}).get("venues", [])
+                        if venues:
+                            venue = venues[0]
+                            capacity = None
+                            if venue.get("generalInfo", {}).get("capacity"):
+                                capacity = venue.get("generalInfo", {}).get("capacity")
+                            if not capacity and venue.get("boxOfficeInfo", {}).get("capacity"):
+                                capacity = venue.get("boxOfficeInfo", {}).get("capacity")
+
+                            if capacity:
+                                try:
+                                    if int(capacity) > VENUE_SIZE_THRESHOLD:
+                                        continue
+                                except (ValueError, TypeError):
+                                    pass
+
+                    seen_event_ids.add(event_id)
+                    all_events.append(event)
+
+        except requests.RequestException as e:
+            pass  # Silently skip genre search errors
 
     # Sort by date
     all_events.sort(key=lambda e: e.get("dates", {}).get("start", {}).get("dateTime", ""))
@@ -306,21 +408,11 @@ with st.sidebar:
 
     # Artists input
     st.subheader("Your Favorite Artists")
-    st.caption("Enter up to 10 artists (one per line)")
+    st.caption("Enter up to 15 artists (one per line)")
     artists_input = st.text_area(
         "Artists",
-        placeholder="Radiohead\nThe National\nPhoebe Bridgers",
-        height=200,
-        label_visibility="collapsed"
-    )
-
-    # Genres input
-    st.subheader("Genres You Like")
-    st.caption("Enter up to 3 genres")
-    genres_input = st.text_area(
-        "Genres",
-        placeholder="indie rock\njazz\nfolk",
-        height=100,
+        placeholder="Radiohead\nThe National\nPhoebe Bridgers\nBon Iver\nThe War on Drugs",
+        height=250,
         label_visibility="collapsed"
     )
 
@@ -329,11 +421,10 @@ with st.sidebar:
 # Process search
 if search_button:
     # Parse inputs
-    artists = [a.strip() for a in artists_input.strip().split("\n") if a.strip()][:10]
-    genres = [g.strip() for g in genres_input.strip().split("\n") if g.strip()][:3]
+    artists = [a.strip() for a in artists_input.strip().split("\n") if a.strip()][:15]
 
-    if not artists and not genres:
-        st.warning("Please enter at least one artist or genre.")
+    if not artists:
+        st.warning("Please enter at least one artist.")
     else:
         # Calculate dates
         start_date = datetime.now()
@@ -370,11 +461,27 @@ if search_button:
                 for original, similar in similar_artist_map.items():
                     st.markdown(f"**{original}** → {', '.join(similar)}")
 
+        # Discover genres from artists
+        all_genre_ids = set()
+        all_genre_names = set()
+        tm_api_key = st.secrets.get("TICKETMASTER_API_KEY", "")
+
+        with st.spinner("Discovering your music taste..."):
+            for artist in artists:  # Only use original artists, not similar ones
+                genre_ids, genre_names = get_artist_genres(artist, tm_api_key)
+                all_genre_ids.update(genre_ids)
+                all_genre_names.update(genre_names)
+
+        # Show discovered genres
+        if all_genre_names:
+            with st.expander("Genres we detected from your artists", expanded=False):
+                st.markdown(", ".join(sorted(all_genre_names)))
+
         # Search for events
         with st.spinner("Searching for concerts..."):
             events = search_ticketmaster_events(
                 all_artists,
-                genres,
+                list(all_genre_ids),
                 latlong,
                 radius,
                 start_date,
@@ -384,33 +491,56 @@ if search_button:
 
         # Display results
         if events:
-            # Fetch popularity scores and sort
+            # Build sets for categorization
+            listed_artists_lower = {a.lower() for a in artists}
+            similar_artists_lower = set()
+            for similar_list in similar_artist_map.values():
+                for s in similar_list:
+                    similar_artists_lower.add(s.lower())
+
+            # Categorize events and fetch popularity
+            your_artists_events = []
+            similar_artists_events = []
+            genre_discovery_events = []
+
+            with st.spinner("Ranking by artist popularity..."):
+                for event in events:
+                    event_artist = extract_artist_from_event(event)
+                    event_artist_lower = event_artist.lower() if event_artist else ""
+
+                    # Get popularity
+                    event["_popularity"] = get_artist_popularity(event_artist) if event_artist else 0
+
+                    # Categorize
+                    if event_artist_lower in listed_artists_lower:
+                        your_artists_events.append(event)
+                    elif event_artist_lower in similar_artists_lower:
+                        similar_artists_events.append(event)
+                    else:
+                        genre_discovery_events.append(event)
+
+            # Sort each tier
             if sort_by.startswith("Popularity"):
-                with st.spinner("Ranking by artist popularity..."):
-                    for event in events:
-                        artist_name = extract_artist_from_event(event)
-                        event["_popularity"] = get_artist_popularity(artist_name) if artist_name else 0
-                    events.sort(key=lambda e: e.get("_popularity", 0), reverse=True)
+                your_artists_events.sort(key=lambda e: e.get("_popularity", 0), reverse=True)
+                similar_artists_events.sort(key=lambda e: e.get("_popularity", 0), reverse=True)
+                genre_discovery_events.sort(key=lambda e: e.get("_popularity", 0), reverse=True)
             else:
-                events.sort(key=lambda e: e.get("dates", {}).get("start", {}).get("dateTime", ""))
+                your_artists_events.sort(key=lambda e: e.get("dates", {}).get("start", {}).get("dateTime", ""))
+                similar_artists_events.sort(key=lambda e: e.get("dates", {}).get("start", {}).get("dateTime", ""))
+                genre_discovery_events.sort(key=lambda e: e.get("dates", {}).get("start", {}).get("dateTime", ""))
 
             st.success(f"Found {len(events)} concerts!")
 
-            for event in events:
+            def display_event(event):
                 formatted = format_event(event)
-
                 col1, col2 = st.columns([1, 3])
-
                 with col1:
                     if formatted["image"]:
                         st.image(formatted["image"], use_container_width=True)
-
                 with col2:
                     st.markdown(f"### {formatted['name']}")
                     st.markdown(f"**{formatted['date']}** {formatted['time']}")
                     st.markdown(f"📍 {formatted['venue']}" + (f", {formatted['city']}" if formatted['city'] else ""))
-
-                    # Show popularity if available
                     if formatted["popularity"] > 0:
                         listeners = formatted["popularity"]
                         if listeners >= 1_000_000:
@@ -420,15 +550,35 @@ if search_button:
                         else:
                             pop_str = f"{listeners} listeners"
                         st.caption(f"🎧 {pop_str} on Last.fm")
-
                     if formatted["price"]:
                         st.markdown(f"💰 {formatted['price']}")
                     if formatted["url"]:
                         st.markdown(f"[🎟️ Get Tickets]({formatted['url']})")
-
                 st.divider()
+
+            # Display Your Artists section
+            if your_artists_events:
+                st.header("🎯 Your Artists")
+                st.caption("Concerts from artists you listed")
+                for event in your_artists_events:
+                    display_event(event)
+
+            # Display Similar Artists section
+            if similar_artists_events:
+                st.header("🎵 Similar Artists")
+                st.caption("Artists similar to your favorites")
+                for event in similar_artists_events:
+                    display_event(event)
+
+            # Display Genre Discoveries section
+            if genre_discovery_events:
+                st.header("🔮 Genre Discoveries")
+                st.caption("Other artists matching your taste profile")
+                for event in genre_discovery_events:
+                    display_event(event)
+
         else:
-            st.info("No concerts found matching your criteria. Try expanding your date range or adding more artists/genres.")
+            st.info("No concerts found matching your criteria. Try expanding your date range, increasing the search radius, or adding more artists.")
 
 # Footer
 st.markdown("---")
